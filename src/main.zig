@@ -5,14 +5,11 @@ const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Condition = Thread.Condition;
 
-const SOCKET_FILE = "/tmp/rllm/daemon.sock";
-const PROGRAM_PATH = "/mnt/pool/random-code/sleeper_agent/zig-out/bin/sleeper_agent";
-
-const MAX_QUEUE = 2;
+const MAX_QUEUE = 32;
 
 const Request = struct {
     pipe: [2]posix.fd_t,
-    connection_fd: posix.fd_t,
+    conn_fd: posix.fd_t,
     args: [][]u8,
     allocator: std.mem.Allocator,
 };
@@ -48,7 +45,7 @@ const Queue = struct {
 
 var global_queue: Queue = .{};
 
-fn readArgs(conn_fd: posix.fd_t, allocator: std.mem.Allocator) ![][]u8 {
+fn readArgs(conn_fd: posix.fd_t, allocator: std.mem.Allocator, program_path: []const u8) ![][]u8 {
     var args = std.ArrayList([]u8).empty;
     errdefer {
         for (args.items) |item| allocator.free(item);
@@ -58,7 +55,7 @@ fn readArgs(conn_fd: posix.fd_t, allocator: std.mem.Allocator) ![][]u8 {
     var line_buf: [4096]u8 = undefined;
     var pos: usize = 0;
 
-    try args.append(allocator, try allocator.dupe(u8, PROGRAM_PATH));
+    try args.append(allocator, try allocator.dupe(u8, program_path));
 
     outer: while (true) {
         var byte: [1]u8 = undefined;
@@ -92,12 +89,12 @@ fn workerThread(_: void) void {
             req.allocator.free(req.args);
             posix.close(req.pipe[0]);
             posix.close(req.pipe[1]);
-            posix.close(req.connection_fd);
+            posix.close(req.conn_fd);
         }
 
-        const result = runProgram(req.args, req.allocator, req.connection_fd);
+        const result = runProgram(req.args, req.allocator, req.conn_fd);
         const reply: []const u8 = if (result) "ok\n" else |_| "err\n";
-        _ = posix.write(req.connection_fd, reply) catch {};
+        _ = posix.write(req.conn_fd, reply) catch {};
     }
 }
 
@@ -110,20 +107,36 @@ fn runProgram(args: [][]u8, allocator: std.mem.Allocator, conn_fd: posix.fd_t) !
     child.stderr_behavior = .Pipe;
     try child.spawn();
 
-    var buf: [4096]u8 = undefined;
+    var poll_fds: [2]posix.pollfd = .{
+        .{ .fd = child.stdout.?.handle, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = child.stderr.?.handle, .events = posix.POLL.IN, .revents = 0 },
+    };
 
-    const child_stdout = child.stdout.?;
-    while (true) {
-        const n = child_stdout.read(&buf) catch break;
-        if (n == 0) break;
-        _ = posix.write(conn_fd, buf[0..n]) catch break;
-    }
+    var line = std.ArrayList(u8).empty;
+    defer line.deinit(allocator);
 
-    const child_stderr = child.stderr.?;
-    while (true) {
-        const n = child_stderr.read(&buf) catch break;
-        if (n == 0) break;
-        _ = posix.write(conn_fd, buf[0..n]) catch break;
+    var open_streams: usize = 2;
+    while (open_streams > 0) {
+        const ready_count = try posix.poll(&poll_fds, -1);
+        if (ready_count == 0) continue;
+
+        for (&poll_fds) |*pfd| {
+            if ((pfd.revents & (posix.POLL.IN | posix.POLL.HUP)) != 0) {
+                var read_buf: [4096]u8 = undefined;
+                const n = try posix.read(pfd.fd, &read_buf);
+
+                if (n == 0) {
+                    open_streams -= 1;
+                    continue;
+                }
+                var written: usize = 0;
+                while (written < n) {
+                    written += try posix.write(conn_fd, read_buf[written..n]);
+                }
+
+                pfd.revents = 0;
+            }
+        }
     }
 
     const term = try child.wait();
@@ -133,10 +146,7 @@ fn runProgram(args: [][]u8, allocator: std.mem.Allocator, conn_fd: posix.fd_t) !
     }
 }
 
-fn acceptLoop(server_fd: posix.fd_t) void {
-    var da = std.heap.DebugAllocator(.{}).init;
-    const allocator = da.allocator();
-
+fn acceptLoop(server_fd: posix.fd_t, allocator: std.mem.Allocator, program_path: []const u8) void {
     while (true) {
         var addr: posix.sockaddr = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
@@ -145,15 +155,12 @@ fn acceptLoop(server_fd: posix.fd_t) void {
             continue;
         };
 
-        const args = readArgs(conn_fd, allocator) catch |err| {
+        const args = readArgs(conn_fd, allocator, program_path) catch |err| {
             _ = posix.write(conn_fd, "err\n") catch {};
             std.debug.print("[daemon] args error: {}\n", .{err});
             posix.close(conn_fd);
             continue;
         };
-
-        var buf: [16]u8 = undefined;
-        _ = posix.read(conn_fd, &buf) catch {};
 
         std.debug.print("[daemon] request received, queuing...\n", .{});
 
@@ -165,7 +172,7 @@ fn acceptLoop(server_fd: posix.fd_t) void {
 
         const req = Request{
             .pipe = pipe_fds,
-            .connection_fd = conn_fd,
+            .conn_fd = conn_fd,
             .allocator = allocator,
             .args = args,
         };
@@ -181,32 +188,67 @@ fn acceptLoop(server_fd: posix.fd_t) void {
 }
 
 pub fn main() !void {
-    std.fs.makeDirAbsolute("/tmp/rllm") catch |e| switch (e) {
+    var da = std.heap.DebugAllocator(.{}).init;
+    defer {
+        const leaked = da.deinit();
+        std.debug.assert(leaked != std.heap.Check.ok);
+    }
+    const allocator = da.allocator();
+
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    const thing = args.next() orelse unreachable;
+    std.debug.print("{s}\n", .{thing});
+
+    const socket_dir = args.next() orelse {
+        std.debug.print("an absolute socket location is required\n", .{});
+        std.process.exit(1);
+    };
+    if (!std.fs.path.isAbsolute(socket_dir)) {
+        std.debug.print("an absolute socket location is required\n", .{});
+        std.process.exit(1);
+    }
+    const socket_file = try std.fs.path.join(
+        allocator,
+        &[_][]const u8{ socket_dir, "daemon.sock" },
+    );
+    defer allocator.free(socket_file);
+
+    std.fs.makeDirAbsolute(socket_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
 
-    var location = try std.fs.openDirAbsolute("/tmp/rllm", .{ .iterate = true });
+    var location = try std.fs.openDirAbsolute(socket_dir, .{ .iterate = true });
     try location.chmod(0o777);
     defer location.close();
 
-    std.fs.deleteFileAbsolute(SOCKET_FILE) catch {};
+    std.fs.deleteFileAbsolute(socket_file) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const program_path = std.process.getEnvVarOwned(allocator, "PROGRAM_PATH") catch {
+        std.debug.print("PROGRAM_PATH is not set!\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(program_path);
 
     const server_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(server_fd);
 
     var sa = posix.sockaddr.un{ .family = posix.AF.UNIX, .path = undefined };
     @memset(&sa.path, 0);
-    const path_bytes = SOCKET_FILE;
-    @memcpy(sa.path[0..path_bytes.len], path_bytes);
+    if (socket_file.len >= sa.path.len) return error.NameTooLong;
+    @memcpy(sa.path[0..socket_file.len], socket_file);
 
     try posix.bind(server_fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.un));
     try posix.listen(server_fd, MAX_QUEUE);
 
-    std.debug.print("[daemon] listening on {s}\n", .{SOCKET_FILE});
+    std.debug.print("[daemon] listening on {s}\n", .{socket_file});
 
     const worker = try Thread.spawn(.{}, workerThread, .{{}});
     worker.detach();
 
-    acceptLoop(server_fd);
+    acceptLoop(server_fd, allocator, program_path);
 }
