@@ -52,28 +52,30 @@ fn readArgs(conn_fd: posix.fd_t, allocator: std.mem.Allocator, program_path: []c
         args.deinit(allocator);
     }
 
+    var read_buf: [4096]u8 = undefined;
     var line_buf: [4096]u8 = undefined;
     var pos: usize = 0;
 
     try args.append(allocator, try allocator.dupe(u8, program_path));
 
     outer: while (true) {
-        var byte: [1]u8 = undefined;
-        const n = try posix.read(conn_fd, &byte);
+        const n = try posix.read(conn_fd, &read_buf);
         if (n == 0) break;
 
-        if (byte[0] == '\n') {
-            const line = line_buf[0..pos];
-            pos = 0;
+        for (read_buf[0..n]) |b| {
+            if (b == '\n') {
+                const line = line_buf[0..pos];
+                pos = 0;
 
-            if (std.mem.eql(u8, line, "run")) continue;
-            if (std.mem.eql(u8, line, "END")) break :outer;
+                if (std.mem.eql(u8, line, "run")) continue;
+                if (std.mem.eql(u8, line, "END")) break :outer;
 
-            try args.append(allocator, try allocator.dupe(u8, line));
-        } else {
-            if (pos < line_buf.len) {
-                line_buf[pos] = byte[0];
-                pos += 1;
+                try args.append(allocator, try allocator.dupe(u8, line));
+            } else {
+                if (pos < line_buf.len) {
+                    line_buf[pos] = b;
+                    pos += 1;
+                }
             }
         }
     }
@@ -197,15 +199,14 @@ pub fn main() !void {
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
-    const thing = args.next() orelse unreachable;
-    std.debug.print("{s}\n", .{thing});
+    _ = args.next();
 
     const socket_dir = args.next() orelse {
-        std.debug.print("an absolute socket location is required\n", .{});
+        std.debug.print("an absolute location for the socket dir is required, pass it as an argument\n", .{});
         std.process.exit(1);
     };
     if (!std.fs.path.isAbsolute(socket_dir)) {
-        std.debug.print("an absolute socket location is required\n", .{});
+        std.debug.print("an absolute location for the socket dir is required, pass it as an argument\n", .{});
         std.process.exit(1);
     }
     const socket_file = try std.fs.path.join(
@@ -220,8 +221,11 @@ pub fn main() !void {
     };
 
     var location = try std.fs.openDirAbsolute(socket_dir, .{ .iterate = true });
-    try location.chmod(0o777);
     defer location.close();
+    location.chmod(0o777) catch |err| {
+        std.debug.print("error in chmod: {}\n", .{err});
+        std.process.exit(1);
+    };
 
     std.fs.deleteFileAbsolute(socket_file) catch |err| switch (err) {
         error.FileNotFound => {},
