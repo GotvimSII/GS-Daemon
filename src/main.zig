@@ -53,8 +53,8 @@ fn readArgs(conn_fd: posix.fd_t, allocator: std.mem.Allocator, program_path: []c
     }
 
     var read_buf: [4096]u8 = undefined;
-    var line_buf: [4096]u8 = undefined;
-    var pos: usize = 0;
+    var line_buf = std.ArrayList(u8).empty;
+    defer line_buf.deinit(allocator);
 
     try args.append(allocator, try allocator.dupe(u8, program_path));
 
@@ -64,18 +64,18 @@ fn readArgs(conn_fd: posix.fd_t, allocator: std.mem.Allocator, program_path: []c
 
         for (read_buf[0..n]) |b| {
             if (b == '\n') {
-                const line = line_buf[0..pos];
-                pos = 0;
+                const line = line_buf.items;
 
-                if (std.mem.eql(u8, line, "run")) continue;
+                if (std.mem.eql(u8, line, "run")) {
+                    line_buf.clearRetainingCapacity();
+                    continue;
+                }
                 if (std.mem.eql(u8, line, "END")) break :outer;
 
                 try args.append(allocator, try allocator.dupe(u8, line));
+                line_buf.clearRetainingCapacity();
             } else {
-                if (pos < line_buf.len) {
-                    line_buf[pos] = b;
-                    pos += 1;
-                }
+                try line_buf.append(allocator, b);
             }
         }
     }
@@ -106,18 +106,17 @@ fn runProgram(args: [][]u8, allocator: std.mem.Allocator, conn_fd: posix.fd_t) !
     var child = std.process.Child.init(const_args, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
     try child.spawn();
 
-    var poll_fds: [2]posix.pollfd = .{
+    var poll_fds: [1]posix.pollfd = .{
         .{ .fd = child.stdout.?.handle, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = child.stderr.?.handle, .events = posix.POLL.IN, .revents = 0 },
     };
 
     var line = std.ArrayList(u8).empty;
     defer line.deinit(allocator);
 
-    var open_streams: usize = 2;
+    var open_streams: usize = 1;
     while (open_streams > 0) {
         const ready_count = try posix.poll(&poll_fds, -1);
         if (ready_count == 0) continue;
